@@ -1,42 +1,39 @@
-# 编译输出目录
-bin/
-build/
+# 编译产物
+bin/*.o
+bin/*.exe
 *.o
 *.exe
-*.dll
-*.so
-
-# Visual Studio 相关文件
-.vs/
-*.vcxproj
-*.vcxproj.filters
-*.vcxproj.user
-*.sln
-*.suo
-*.user
 
 # 临时文件
-*.tmp
-*.temp
 *~
+*.tmp
+*.swp
 .DS_Store
 Thumbs.db
 
-# IDE 配置文件
+# Visual Studio Code
 .vscode/
-.idea/
-*.swp
-*.swo
 
-# 编译缓存
-*.cache
+# 编译器生成文件
+*.obj
+*.lib
+*.dll
 *.pdb
-*.ilk
+
+# 日志文件
+*.log
+
+# 备份文件
+*.bak
+*.backup
+
+# 依赖文件
+*.d
 
 # 调试文件
-*.log
+*.gdb_history
 core
-debug.txt
+core.*
 
-# 操作系统文件
-*.lnk
+# Windows 系统文件
+desktop.ini

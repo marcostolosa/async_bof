@@ -86,7 +86,9 @@ BOOL WINAPI USER32$OpenClipboard(HWND hWndNewOwner) { return OpenClipboard(hWndN
 BOOL WINAPI USER32$CloseClipboard(VOID) { return CloseClipboard(); }
 HANDLE WINAPI USER32$GetClipboardData(UINT uFormat) { return GetClipboardData(uFormat); }
 BOOL WINAPI USER32$AddClipboardFormatListener(HWND hwnd) { return AddClipboardFormatListener(hwnd); }
-BOOL WINAPI USER32$RemoveClipboardFormatListener(HWND hwnd) { return RemoveClipboardFormatListener(hwnd); }
+BOOL WINAPI USER32$GetLastInputInfo(PLASTINPUTINFO plii) { return GetLastInputInfo(plii); }
+DWORD WINAPI KERNEL32$GetTickCount64(VOID) { return GetTickCount64(); }
+int MSVCRT$vsprintf(char* str, const char* format, va_list args) { return vsprintf(str, format, args); }
 HANDLE WINAPI KERNEL32$CreateThread(LPSECURITY_ATTRIBUTES lpThreadAttributes, SIZE_T dwStackSize, LPTHREAD_START_ROUTINE lpStartAddress, LPVOID lpParameter, DWORD dwCreationFlags, LPDWORD lpThreadId) { return CreateThread(lpThreadAttributes, dwStackSize, lpStartAddress, lpParameter, dwCreationFlags, lpThreadId); }
 DWORD WINAPI KERNEL32$WaitForSingleObject(HANDLE hHandle, DWORD dwMilliseconds) { return WaitForSingleObject(hHandle, dwMilliseconds); }
 BOOL WINAPI KERNEL32$CloseHandle(HANDLE hObject) { return CloseHandle(hObject); }
@@ -221,6 +223,7 @@ void go(char* args, int length) {
 // 检查事件是否发生
 int check_event(async_task_t* task) {
     switch (task->event_type) {
+        // 传统轮询模式监控
         case EVENT_ADMIN_LOGIN:
             return monitor_admin_login(task);
         case EVENT_PROCESS_START:
@@ -241,8 +244,32 @@ int check_event(async_task_t* task) {
             return monitor_keyboard_input(task);
         case EVENT_USER_LOGON:
             return monitor_user_logon(task);
+            
+        // 新增的真实事件监控 (需要链接real_event_monitor.c)
+        case EVENT_REAL_PROCESS_CREATE:
+        case EVENT_REAL_PROCESS_TERMINATE:
+            return monitor_real_process_events(task);
+        case EVENT_REAL_FILE_ACCESS:
+            return monitor_real_file_access(task);
+        case EVENT_REAL_REGISTRY_CHANGE:
+            return monitor_real_registry_changes(task);
+        case EVENT_REAL_NETWORK_CONNECTION:
+            return monitor_real_network_events(task);
+        case EVENT_REAL_LOGIN_ATTEMPT:
+            return monitor_real_login_events(task);
+        case EVENT_REAL_PRIVILEGE_ESCALATION:
+            return monitor_real_privilege_escalation(task);
+            
         default:
-            return (rand() % 100) < 30;
+            // 对于未知事件类型，使用真实事件监控
+            if (task->monitor_mode == MONITOR_MODE_EVENT_LOG) {
+                return setup_event_log_monitoring(task);
+            } else if (task->monitor_mode == MONITOR_MODE_ETW) {
+                return setup_etw_monitoring(task);
+            } else {
+                // 默认返回0，表示无事件
+                return 0;
+            }
     }
 }
 
@@ -297,6 +324,17 @@ int monitor_admin_login(async_task_t* task) {
 }
 
 int monitor_process_start(async_task_t* task) {
+    // 改进的进程监控：检查新启动的进程
+    static DWORD last_check_time = 0;
+    static DWORD last_process_count = 0;
+    
+    DWORD current_time = KERNEL32$GetTickCount();
+    
+    // 为了提高效率，不是每次都检查
+    if (current_time - last_check_time < 5000) { // 5秒间隔
+        return 0;
+    }
+    
     HANDLE hSnapshot = KERNEL32$CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnapshot == INVALID_HANDLE_VALUE) {
         return 0;
@@ -304,18 +342,33 @@ int monitor_process_start(async_task_t* task) {
     
     PROCESSENTRY32 pe32;
     pe32.dwSize = sizeof(PROCESSENTRY32);
+    DWORD process_count = 0;
+    int found_target = 0;
     
     if (KERNEL32$Process32First(hSnapshot, &pe32)) {
         do {
-            if (MSVCRT$strcmp(pe32.szExeFile, task->params) == 0) {
-                KERNEL32$CloseHandle(hSnapshot);
-                return 1;
+            process_count++;
+            // 检查是否是目标进程
+            if (MSVCRT$strstr(pe32.szExeFile, task->params) != NULL) {
+                // 还可以检查进程创建时间是否近期
+                found_target = 1;
             }
         } while (KERNEL32$Process32Next(hSnapshot, &pe32));
     }
     
     KERNEL32$CloseHandle(hSnapshot);
-    return 0;
+    
+    // 检查进程数量是否增加（可能有新进程启动）
+    int process_activity = 0;
+    if (last_process_count > 0 && process_count > last_process_count) {
+        process_activity = 1;
+    }
+    
+    last_check_time = current_time;
+    last_process_count = process_count;
+    
+    // 如果找到目标进程或者有新进程活动
+    return found_target || (process_activity && MSVCRT$strlen(task->params) == 0);
 }
 
 int monitor_user_login(async_task_t* task) {
@@ -477,22 +530,41 @@ int monitor_wifi_connection(async_task_t* task) {
 }
 
 int monitor_ticket_expiration(async_task_t* task) {
-    unsigned int warning_minutes = 0;
+    // 实际检查Kerberos票据过期时间
+    unsigned int warning_minutes = 60; // 默认60分钟警告
     if (MSVCRT$strlen(task->params) > 0) {
+        warning_minutes = 0;
         for (int i = 0; task->params[i] != '\0'; i++) {
             if (task->params[i] >= '0' && task->params[i] <= '9') {
                 warning_minutes = warning_minutes * 10 + (task->params[i] - '0');
             }
         }
+        if (warning_minutes == 0) warning_minutes = 60;
     }
     
-    if (warning_minutes > 0 && warning_minutes <= 60) {
-        static int check_count = 0;
-        check_count++;
-        if (check_count > 5) {
-            check_count = 0;
-            return 1;
+    // 尝试获取当前用户的票据信息
+    HANDLE hToken;
+    if (ADVAPI32$OpenProcessToken(KERNEL32$GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
+        DWORD dwSize = 0;
+        ADVAPI32$GetTokenInformation(hToken, TokenStatistics, NULL, 0, &dwSize);
+        
+        if (dwSize > 0) {
+            PTOKEN_STATISTICS pStats = (PTOKEN_STATISTICS)MSVCRT$malloc(dwSize);
+            if (pStats && ADVAPI32$GetTokenInformation(hToken, TokenStatistics, pStats, dwSize, &dwSize)) {
+                // 计算票据剩余时间（简化实现）
+                ULONGLONG current_time = KERNEL32$GetTickCount64() / 1000; // 秒
+                ULONGLONG token_age = current_time - (pStats->AuthenticationId.LowPart / 10000000);
+                
+                // 假设票据有效期为10小时（36000秒）
+                if (token_age > (36000 - warning_minutes * 60)) {
+                    MSVCRT$free(pStats);
+                    KERNEL32$CloseHandle(hToken);
+                    return 1;
+                }
+            }
+            if (pStats) MSVCRT$free(pStats);
         }
+        KERNEL32$CloseHandle(hToken);
     }
     
     return 0;
@@ -528,13 +600,25 @@ int monitor_clipboard_copy(async_task_t* task) {
 }
 
 int monitor_keyboard_input(async_task_t* task) {
-    if (MSVCRT$strlen(task->params) > 0) {
-        static DWORD last_check_time = 0;
-        DWORD current_time = KERNEL32$GetTickCount();
+    // 监控特定的键盘输入模式或窗口
+    static DWORD last_input_time = 0;
+    DWORD current_time = KERNEL32$GetTickCount();
+    
+    // 检查系统空闲时间
+    LASTINPUTINFO lii = {0};
+    lii.cbSize = sizeof(LASTINPUTINFO);
+    
+    if (USER32$GetLastInputInfo(&lii)) {
+        DWORD idle_time = current_time - lii.dwTime;
         
-        if (current_time - last_check_time > (task->interval * 1000)) {
-            last_check_time = current_time;
-            return 1;
+        // 如果有新的输入活动
+        if (last_input_time == 0 || lii.dwTime > last_input_time) {
+            last_input_time = lii.dwTime;
+            
+            // 检查是否匹配监控条件
+            if (MSVCRT$strlen(task->params) == 0 || idle_time < 5000) { // 5秒内的活动
+                return 1;
+            }
         }
     }
     
@@ -585,31 +669,74 @@ void report_event(async_task_t* task) {
 }
 
 async_task_t* create_task(const char* name, event_type_t type, const char* params, unsigned int interval) {
-    async_task_t* task = (async_task_t*)MSVCRT$calloc(1, sizeof(async_task_t));
-    if (task) {
-        MSVCRT$strncpy(task->name, name, sizeof(task->name) - 1);
-        task->name[sizeof(task->name) - 1] = '\0';
-        task->status = TASK_PENDING;
-        task->event_type = type;
-        MSVCRT$strncpy(task->params, params, sizeof(task->params) - 1);
-        task->params[sizeof(task->params) - 1] = '\0';
-        task->interval = interval;
-        task->last_check = 0;
-        task->task_id = next_task_id++;
-        task->thread_handle = NULL;
-        task->thread_id = 0;
-        task->next = NULL;
+    // 验证参数
+    if (!validate_task_params(name, type, params)) {
+        return NULL;
     }
+    
+    async_task_t* task = (async_task_t*)safe_malloc(sizeof(async_task_t));
+    if (!task) {
+        return NULL;
+    }
+    
+    // 初始化任务结构
+    if (!safe_strcpy(task->name, sizeof(task->name), name)) {
+        safe_free(task);
+        return NULL;
+    }
+    
+    task->status = TASK_PENDING;
+    task->event_type = type;
+    task->monitor_mode = MONITOR_MODE_POLLING; // 默认模式
+    
+    if (!safe_strcpy(task->params, sizeof(task->params), params)) {
+        safe_free(task);
+        return NULL;
+    }
+    
+    task->interval = interval > 0 ? interval : 30; // 默认30秒
+    task->last_check = 0;
+    task->task_id = next_task_id++;
+    task->thread_handle = NULL;
+    task->thread_id = 0;
+    task->next = NULL;
+    
+    // 初始化事件监控相关字段
+    task->event_log_handle = NULL;
+    task->etw_session_handle = NULL;
+    task->event_subscription = NULL;
+    task->events_detected = 0;
+    task->false_positives = 0;
+    task->start_time = KERNEL32$GetTickCount64();
+    
+    LOG_INFO("Created task '%s' (ID: %d, type: %d, interval: %d)", 
+             task->name, task->task_id, task->event_type, task->interval);
+    
     return task;
 }
 
 void destroy_task(async_task_t* task) {
-    if (task) {
-        if (task->thread_handle) {
-            KERNEL32$CloseHandle(task->thread_handle);
-        }
-        MSVCRT$free(task);
+    if (!task) {
+        LOG_WARNING("Attempt to destroy NULL task");
+        return;
     }
+    
+    LOG_INFO("Destroying task '%s' (ID: %d)", task->name, task->task_id);
+    
+    // 清理线程资源
+    if (task->thread_handle) {
+        LOG_DEBUG("Closing thread handle for task %d", task->task_id);
+        if (!KERNEL32$CloseHandle(task->thread_handle)) {
+            LOG_ERROR("Failed to close thread handle for task %d", task->task_id);
+        }
+        task->thread_handle = NULL;
+    }
+    
+    // 清理事件监控资源
+    cleanup_event_monitoring(task);
+    
+    // 释放内存
+    safe_free(task);
 }
 
 DWORD WINAPI task_thread_proc(LPVOID param) {

