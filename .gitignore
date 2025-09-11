@@ -1,0 +1,42 @@
+# 编译输出目录
+bin/
+build/
+*.o
+*.exe
+*.dll
+*.so
+
+# Visual Studio 相关文件
+.vs/
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.sln
+*.suo
+*.user
+
+# 临时文件
+*.tmp
+*.temp
+*~
+.DS_Store
+Thumbs.db
+
+# IDE 配置文件
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 编译缓存
+*.cache
+*.pdb
+*.ilk
+
+# 调试文件
+*.log
+core
+debug.txt
+
+# 操作系统文件
+*.lnk
